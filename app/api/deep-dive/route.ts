@@ -1,40 +1,31 @@
 import { NextRequest, NextResponse } from "next/server";
+import { createClient } from "@supabase/supabase-js";
+
+const supabase = createClient(
+  process.env.NEXT_PUBLIC_SUPABASE_URL!,
+  process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!
+);
 
 export async function POST(req: NextRequest) {
-  const { quote, book_name, category } = await req.json();
+  const { highlight_id, quote, book_name, category } = await req.json();
 
-  if (!quote) {
-    return NextResponse.json({ error: "Quote is required" }, { status: 400 });
+  if (!quote || !highlight_id) {
+    return NextResponse.json({ error: "Missing data" }, { status: 400 });
   }
 
-  const systemPrompt = `You are a knowledge explainer. Explain the following quote clearly and educationally.
-
-Rules:
-- Only analyze the quote provided. Do not invent research or statistics.
-- Do NOT fabricate links, citations, or studies.
-- Avoid motivational fluff or vague writing.
-- Use clear reasoning and concrete, grounded examples.
-- Keep explanations precise and educational.
-- If sources are uncertain, write exactly: "No verified sources available"
-
-Respond ONLY with a valid JSON object. No preamble, no markdown fences. The JSON must have exactly these keys:
-{
-  "topic": "The core concept or subject of this quote (1-2 sentences)",
-  "context": "The intellectual or historical context in which this idea exists (2-3 sentences)",
-  "explanation": "A clear, logical breakdown of what the quote means (3-5 sentences)",
-  "examples": "1-2 concrete real-world examples that illustrate this idea",
-  "why_it_matters": "Why this idea is practically important (2-3 sentences)",
-  "memory_reinforcement": "A vivid mental model, analogy, or mnemonic to remember this idea",
-  "sources": "Only verified thinkers, books, or fields — or write: No verified sources available"
-}`;
-
-  const userMessage = `Quote: "${quote}"
-Book: ${book_name}
-Category: ${category}
-
-Please provide a deep-dive explanation of this quote following the output format.`;
-
   try {
+    // 🔍 STEP 1: Check if deep dive already exists
+    const { data: existing } = await supabase
+      .from("deep_dives")
+      .select("*")
+      .eq("highlight_id", highlight_id)
+      .single();
+
+    if (existing) {
+      return NextResponse.json(existing);
+    }
+
+    // 🤖 STEP 2: Call Claude
     const response = await fetch("https://api.anthropic.com/v1/messages", {
       method: "POST",
       headers: {
@@ -45,27 +36,40 @@ Please provide a deep-dive explanation of this quote following the output format
       body: JSON.stringify({
         model: "claude-haiku-4-5-20251001",
         max_tokens: 1000,
-        system: systemPrompt,
-        messages: [{ role: "user", content: userMessage }],
+        system: `You are a knowledge explainer. No hallucination. Structured output only.`,
+        messages: [
+          {
+            role: "user",
+            content: `Quote: "${quote}"`,
+          },
+        ],
       }),
     });
 
     const data = await response.json();
-
-    if (!response.ok) {
-      throw new Error(data.error?.message || "Anthropic API error");
-    }
-
     const text = data.content?.[0]?.text;
-    if (!text) throw new Error("No response from AI");
 
-    // Parse JSON from response
+    if (!text) throw new Error("No AI response");
+
     const clean = text.replace(/```json|```/g, "").trim();
     const parsed = JSON.parse(clean);
 
+    // 💾 STEP 3: Save structured fields
+    const { error } = await supabase.from("deep_dives").insert({
+      highlight_id,
+      topic: parsed.topic,
+      context: parsed.context,
+      explanation: parsed.explanation,
+      examples: parsed.examples,
+      why_it_matters: parsed.why_it_matters,
+      memory_reinforcement: parsed.memory_reinforcement,
+      sources: parsed.sources,
+    });
+
+    if (error) throw error;
+
     return NextResponse.json(parsed);
-  } catch (err: unknown) {
-    const message = err instanceof Error ? err.message : "Unknown error";
-    return NextResponse.json({ error: message }, { status: 500 });
+  } catch (err: any) {
+    return NextResponse.json({ error: err.message }, { status: 500 });
   }
 }
